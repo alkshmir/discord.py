@@ -143,12 +143,15 @@ class Loop(Generic[LF]):
         minutes: float,
         time: Union[datetime.time, Sequence[datetime.time]],
         count: Optional[int],
+        retry_limited_count: Optional[int],
         reconnect: bool,
     ) -> None:
         self.coro: LF = coro
         self.reconnect: bool = reconnect
         self.count: Optional[int] = count
+        self.retry_limited_count: Optional[int] = retry_limited_count
         self._current_loop = 0
+        self._retry_limited_loop = 0
         self._handle: Optional[SleepHandle] = None
         self._task: Optional[asyncio.Task[None]] = None
         self._injected = None
@@ -159,6 +162,7 @@ class Loop(Generic[LF]):
             aiohttp.ClientError,
             asyncio.TimeoutError,
         )
+        self._retry_limited_exception = ()
 
         self._before_loop = None
         self._after_loop = None
@@ -168,6 +172,9 @@ class Loop(Generic[LF]):
 
         if self.count is not None and self.count <= 0:
             raise ValueError('count must be greater than 0 or None.')
+
+        if retry_limited_count is not None and retry_limited_count <= 0:
+            raise ValueError('retry_limited_count must be greater than 0 or None.')
 
         self.change_interval(seconds=seconds, minutes=minutes, hours=hours, time=time)
         self._last_iteration_failed = False
@@ -238,11 +245,15 @@ class Loop(Generic[LF]):
                 try:
                     await self.coro(*args, **kwargs)
                     self._last_iteration_failed = False
-                except self._valid_exception:
+                except (*self._valid_exception, *self._retry_limited_exception) as e:
                     self._last_iteration_failed = True
                     if not self.reconnect:
                         raise
                     await asyncio.sleep(backoff.delay())
+                    if isinstance(e, self._retry_limited_exception):
+                        self._retry_limited_loop += 1
+                        if self._retry_limited_loop == self.retry_limited_count:
+                            raise
                 else:
                     if self._stop_next_iteration:
                         return
@@ -268,6 +279,7 @@ class Loop(Generic[LF]):
                 self._handle.cancel()
             self._is_being_cancelled = False
             self._current_loop = 0
+            self._retry_limited_loop = 0
             self._stop_next_iteration = False
 
     def __get__(self, obj: T, objtype: Type[T]) -> Loop[LF]:
@@ -281,6 +293,7 @@ class Loop(Generic[LF]):
             minutes=self._minutes,
             time=self._time,
             count=self.count,
+            retry_limited_count=self.retry_limited_count,
             reconnect=self.reconnect,
         )
         copy._injected = obj
@@ -334,6 +347,11 @@ class Loop(Generic[LF]):
     def current_loop(self) -> int:
         """:class:`int`: The current iteration of the loop."""
         return self._current_loop
+
+    @property
+    def retry_limited_loop(self) -> int:
+        """:class:`int`: The current iteration of the loop caused by retry limited exceptions."""
+        return self._retry_limited_loop
 
     @property
     def next_iteration(self) -> Optional[datetime.datetime]:
@@ -484,6 +502,31 @@ class Loop(Generic[LF]):
 
         self._valid_exception = (*self._valid_exception, *exceptions)
 
+    def add_retry_limited_exception_type(self, *exceptions: Type[BaseException]) -> None:
+        r"""Adds retry limited exception type to be handled during the reconnect logic.
+
+        Unlike :meth:`add_exception_type`, this method adds exception types that have 
+        retry limits defined by :attr:`retry_limited_count`.
+
+        Parameters
+        ------------
+        \*exceptions: Type[:class:`BaseException`]
+            An argument list of exception classes to handle.
+
+        Raises
+        --------
+        TypeError
+            An exception passed is either not a class or not inherited from :class:`BaseException`.
+        """
+
+        for exc in exceptions:
+            if not inspect.isclass(exc):
+                raise TypeError(f'{exc!r} must be a class.')
+            if not issubclass(exc, BaseException):
+                raise TypeError(f'{exc!r} must inherit from BaseException.')
+
+        self._retry_limited_exception = (*self._retry_limited_exception, *exceptions)
+
     def clear_exception_types(self) -> None:
         """Removes all exception types that are handled.
 
@@ -492,6 +535,7 @@ class Loop(Generic[LF]):
             This operation obviously cannot be undone!
         """
         self._valid_exception = ()
+        self._retry_limited_exception = ()
 
     def remove_exception_type(self, *exceptions: Type[BaseException]) -> bool:
         r"""Removes exception types from being handled during the reconnect logic.
@@ -509,6 +553,23 @@ class Loop(Generic[LF]):
         old_length = len(self._valid_exception)
         self._valid_exception = tuple(x for x in self._valid_exception if x not in exceptions)
         return len(self._valid_exception) == old_length - len(exceptions)
+
+    def remove_retry_limited_exception_type(self, *exceptions: Type[BaseException]) -> bool:
+        r"""Removes retry limited exception types from being handled during the reconnect logic.
+
+        Parameters
+        ------------
+        \*exceptions: Type[:class:`BaseException`]
+            An argument list of exception classes to handle.
+
+        Returns
+        ---------
+        :class:`bool`
+            Whether all exceptions were successfully removed.
+        """
+        old_length = len(self._retry_limited_exception)
+        self._retry_limited_exception = tuple(x for x in self._retry_limited_exception if x not in exceptions)
+        return len(self._retry_limited_exception) == old_length - len(exceptions)
 
     def get_task(self) -> Optional[asyncio.Task[None]]:
         """Optional[:class:`asyncio.Task`]: Fetches the internal task or ``None`` if there isn't one running."""
@@ -769,6 +830,7 @@ def loop(
     hours: float = MISSING,
     time: Union[datetime.time, Sequence[datetime.time]] = MISSING,
     count: Optional[int] = None,
+    retry_limited_count: Optional[int] = None,
     reconnect: bool = True,
 ) -> Callable[[LF], Loop[LF]]:
     """A decorator that schedules a task in the background for you with
@@ -798,6 +860,9 @@ def loop(
     count: Optional[:class:`int`]
         The number of loops to do, ``None`` if it should be an
         infinite loop.
+    retry_limited_count: Optional[:class:`int`]
+        The number of retries for exception types added with :meth:`add_retry_limited_exception_type`.
+        ``None`` if it should be an infinite loop.
     reconnect: :class:`bool`
         Whether to handle errors and restart the task
         using an exponential back-off algorithm similar to the
@@ -819,6 +884,7 @@ def loop(
             minutes=minutes,
             hours=hours,
             count=count,
+            retry_limited_count=retry_limited_count,
             time=time,
             reconnect=reconnect,
         )
